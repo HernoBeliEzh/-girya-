@@ -1,0 +1,20 @@
+# Каталоги данных пользователя (на всякий случай, если кто-то запустит из репо)
+config.json
+*.cookie
+*.secret
+bin/
+
+# Логи
+*.log
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Редакторы
+.vscode/
+.idea/
+*.swp
+
+# Служебное (Claude Code / сессии)
+.claude/
