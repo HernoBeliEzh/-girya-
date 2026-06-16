@@ -17,7 +17,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('menu','add','remove','use','list','serve','key','config','opencode','model','websearch')]
+    [ValidateSet('menu','add','remove','use','list','serve','key','config','opencode','model','websearch','cookie')]
     [string] $Command = 'menu',
 
     [string] $Name,
@@ -185,6 +185,19 @@ function Invoke-MenuAddAccount {
     Add-GiryaAccount -Name $name -Cookie $cookie -SessionId $sid -UserId $uid
 }
 
+function Invoke-MenuUpdateCookie {
+    $accounts = @(Get-GiryaAccounts)
+    if ($accounts.Count -eq 0) { Write-GiryaWarn 'Нет аккаунтов.'; return }
+    $active = Get-GiryaActiveAccount
+    $name = Read-Host "Имя аккаунта для обновления cookie (Enter = активный '$($active.name)')"
+    if ([string]::IsNullOrWhiteSpace($name)) { $name = $active.name }
+    Write-Host 'Новый cookie с clerk.whizi.io (должен содержать __client). Бери свежий и не сиди в whizi в браузере.' -ForegroundColor Cyan
+    $cookie = Read-Host 'Cookie'
+    if ([string]::IsNullOrWhiteSpace($cookie)) { Write-GiryaWarn 'Пусто — отменено.'; return }
+    Set-GiryaAccountCookie -Name $name -Cookie $cookie
+    Write-GiryaOk "Cookie аккаунта '$name' обновлён."
+}
+
 function Invoke-MenuRemoveAccount {
     Show-GiryaAccounts
     $name = Read-Host 'Имя аккаунта для удаления'
@@ -207,6 +220,7 @@ function Show-GiryaMenu {
         Write-Host ' 2) Добавить аккаунт (cookie)' -ForegroundColor White
         Write-Host ' 3) Удалить аккаунт'           -ForegroundColor White
         Write-Host ' 4) Сменить активный аккаунт'  -ForegroundColor White
+        Write-Host ' u) Обновить cookie аккаунта'  -ForegroundColor White
         Write-Host ' 5) Сменить модель'            -ForegroundColor White
         Write-Host ' 6) Веб-поиск (вкл/выкл)'      -ForegroundColor White
         Write-Host ' 7) Показать API-ключ / Base URL' -ForegroundColor White
@@ -224,6 +238,7 @@ function Show-GiryaMenu {
                 '2' { Invoke-MenuAddAccount }
                 '3' { Invoke-MenuRemoveAccount }
                 '4' { Invoke-MenuUseAccount }
+                'u' { Invoke-MenuUpdateCookie }
                 '5' { Invoke-MenuModel }
                 '6' { Invoke-MenuWebSearch }
                 '7' { Show-GiryaKey }
@@ -270,4 +285,13 @@ switch ($Command) {
     'opencode' { Show-GiryaOpenCode }
     'model'    { Show-GiryaModel -Model $Model }
     'websearch' { Show-GiryaWebSearch -State $State }
+    'cookie'   {
+        if (-not $Name) {
+            $a = Get-GiryaActiveAccount
+            if ($a) { $Name = $a.name } else { $Name = Read-Host 'Имя аккаунта' }
+        }
+        if (-not $Cookie) { $Cookie = Read-Host 'Новый cookie (с __client)' }
+        Set-GiryaAccountCookie -Name $Name -Cookie $Cookie
+        Write-GiryaOk "Cookie аккаунта '$Name' обновлён."
+    }
 }

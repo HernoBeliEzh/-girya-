@@ -60,9 +60,27 @@ function New-GiryaModelObject {
     }
 }
 
+# Построить JSON-массив tool_calls (ВСЕГДА в квадратных скобках, даже для 1 элемента —
+# ConvertTo-Json в PS схлопывает массив из одного элемента в объект, а OpenCode ждёт массив).
+function Get-GiryaToolCallsJson {
+    param($ToolCalls)
+    $i = 0
+    $items = foreach ($t in @($ToolCalls)) {
+        $obj = [pscustomobject]@{
+            index    = $i
+            id       = $t.id
+            type     = 'function'
+            function = [pscustomobject]@{ name = $t.name; arguments = $t.arguments }
+        }
+        $i++
+        $obj | ConvertTo-Json -Depth 20 -Compress
+    }
+    return '[' + (@($items) -join ',') + ']'
+}
+
 # Стриминг ответа в формате OpenAI SSE (text/event-stream).
 function Send-GiryaStream {
-    param($Context, [string]$Model, [string]$Content)
+    param($Context, [string]$Model, [string]$Content, $ToolCalls = @())
 
     $resp = $Context.Response
     $resp.StatusCode  = 200
@@ -87,20 +105,34 @@ function Send-GiryaStream {
     } | ConvertTo-Json -Depth 10 -Compress
     Write-Chunk $first
 
-    # Контент разбиваем на небольшие части, чтобы клиент видел «печать».
-    $chunkSize = 24
-    for ($i = 0; $i -lt $Content.Length; $i += $chunkSize) {
-        $piece = $Content.Substring($i, [Math]::Min($chunkSize, $Content.Length - $i))
+    $tc = @($ToolCalls)
+    if ($tc.Count -gt 0) {
+        # Вызовы инструментов: один чанк с delta.tool_calls (массив гарантируем подстановкой).
+        $callsJson = Get-GiryaToolCallsJson -ToolCalls $tc
         $obj = @{
             id = $id; object = 'chat.completion.chunk'; created = 1700000000; model = $Model
-            choices = @(@{ index = 0; delta = @{ content = $piece }; finish_reason = $null })
-        } | ConvertTo-Json -Depth 10 -Compress
+            choices = @(@{ index = 0; delta = @{ tool_calls = '__TOOLCALLS__' }; finish_reason = $null })
+        } | ConvertTo-Json -Depth 20 -Compress
+        $obj = $obj.Replace('"__TOOLCALLS__"', $callsJson)
         Write-Chunk $obj
+        $finish = 'tool_calls'
+    } else {
+        # Контент разбиваем на небольшие части, чтобы клиент видел «печать».
+        $chunkSize = 24
+        for ($i = 0; $i -lt $Content.Length; $i += $chunkSize) {
+            $piece = $Content.Substring($i, [Math]::Min($chunkSize, $Content.Length - $i))
+            $obj = @{
+                id = $id; object = 'chat.completion.chunk'; created = 1700000000; model = $Model
+                choices = @(@{ index = 0; delta = @{ content = $piece }; finish_reason = $null })
+            } | ConvertTo-Json -Depth 10 -Compress
+            Write-Chunk $obj
+        }
+        $finish = 'stop'
     }
 
     $last = @{
         id = $id; object = 'chat.completion.chunk'; created = 1700000000; model = $Model
-        choices = @(@{ index = 0; delta = @{}; finish_reason = 'stop' })
+        choices = @(@{ index = 0; delta = @{}; finish_reason = $finish })
     } | ConvertTo-Json -Depth 10 -Compress
     Write-Chunk $last
 
@@ -110,9 +142,28 @@ function Send-GiryaStream {
 
 # Полный (нестриминговый) ответ в формате OpenAI.
 function Send-GiryaCompletion {
-    param($Context, [string]$Model, [string]$Content)
-    $promptTokens = 0
-    $completionTokens = [int]([Math]::Ceiling($Content.Length / 4.0))
+    param($Context, [string]$Model, [string]$Content, $ToolCalls = @())
+    $tc = @($ToolCalls)
+    $completionTokens = [int]([Math]::Ceiling((([string]$Content).Length + 1) / 4.0))
+    if ($tc.Count -gt 0) {
+        $callsJson = Get-GiryaToolCallsJson -ToolCalls $tc
+        $obj = [pscustomobject]@{
+            id      = "chatcmpl-girya-$([guid]::NewGuid().ToString('N').Substring(0,12))"
+            object  = 'chat.completion'; created = 1700000000; model = $Model
+            choices = @([pscustomobject]@{
+                index = 0
+                message = [pscustomobject][ordered]@{ role = 'assistant'; content = $null; tool_calls = '__TOOLCALLS__' }
+                finish_reason = 'tool_calls'
+            })
+            usage = [pscustomobject]@{ prompt_tokens = 0; completion_tokens = $completionTokens; total_tokens = $completionTokens }
+        }
+        $json = ($obj | ConvertTo-Json -Depth 20 -Compress).Replace('"__TOOLCALLS__"', $callsJson)
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+        $r = $Context.Response
+        $r.StatusCode = 200; $r.ContentType = 'application/json; charset=utf-8'; $r.ContentLength64 = $bytes.Length
+        $r.OutputStream.Write($bytes, 0, $bytes.Length); $r.OutputStream.Close()
+        return
+    }
     $obj = [pscustomobject]@{
         id      = "chatcmpl-girya-$([guid]::NewGuid().ToString('N').Substring(0,12))"
         object  = 'chat.completion'
@@ -126,7 +177,7 @@ function Send-GiryaCompletion {
             }
         )
         usage   = [pscustomobject]@{
-            prompt_tokens     = $promptTokens
+            prompt_tokens     = 0
             completion_tokens = $completionTokens
             total_tokens      = $completionTokens
         }
@@ -215,20 +266,41 @@ function Start-GiryaServer {
                 $messages = @($body.messages)
                 $model    = if ($body.PSObject.Properties.Name -contains 'model' -and $body.model) { [string]$body.model } else { '' }
                 $stream   = ($body.PSObject.Properties.Name -contains 'stream') -and ([bool]$body.stream)
+                $tools    = @()
+                if ($body.PSObject.Properties.Name -contains 'tools' -and $body.tools) { $tools = @($body.tools) }
+
+                # Отладочный лог: сохраняем последний запрос (включая tools) для диагностики.
+                if ($cfg.PSObject.Properties.Name -contains 'debug' -and $cfg.debug) {
+                    try {
+                        $dbg = Join-Path $script:GiryaDataDir 'debug.log'
+                        $toolNames = @($tools | ForEach-Object { $_.function.name }) -join ', '
+                        $line = "REQUEST stream=$stream tools=$(@($tools).Count) [$toolNames]`n$bodyRaw`n"
+                        Set-Content -LiteralPath $dbg -Value $line -Encoding UTF8
+                    } catch {}
+                }
 
                 try {
-                    $content = Invoke-WhiziChat -Messages $messages -Model $model
+                    $res = Invoke-WhiziChat -Messages $messages -Model $model -Tools $tools
                 }
                 catch {
                     Send-GiryaJson -Context $context -Status 502 -Object @{ error = @{ message = $_.Exception.Message; type = 'upstream_error' } }
                     continue
                 }
 
+                if ($cfg.PSObject.Properties.Name -contains 'debug' -and $cfg.debug) {
+                    try {
+                        $dbg = Join-Path $script:GiryaDataDir 'debug.log'
+                        $add = "`n---RESULT--- toolCalls=$(@($res.toolCalls).Count)`ncontent: $([string]$res.content)`ntoolCalls: $((@($res.toolCalls) | ForEach-Object { $_.name + ' ' + $_.arguments }) -join ' | ')`n"
+                        Add-Content -LiteralPath $dbg -Value $add -Encoding UTF8
+                    } catch {}
+                }
+
                 $replyModel = if ($model) { $model } else { (Get-GiryaConfig).whizi.defaultModel }
+                $toolCalls  = @($res.toolCalls)
                 if ($stream) {
-                    Send-GiryaStream     -Context $context -Model $replyModel -Content $content
+                    Send-GiryaStream     -Context $context -Model $replyModel -Content ([string]$res.content) -ToolCalls $toolCalls
                 } else {
-                    Send-GiryaCompletion -Context $context -Model $replyModel -Content $content
+                    Send-GiryaCompletion -Context $context -Model $replyModel -Content ([string]$res.content) -ToolCalls $toolCalls
                 }
                 continue
             }

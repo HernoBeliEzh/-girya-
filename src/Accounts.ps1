@@ -75,6 +75,22 @@ function Set-GiryaAccountSessionId {
     Save-GiryaConfig $cfg
 }
 
+# Обновить cookie аккаунта (шифрует и сохраняет). Используется при ротации токена
+# и для ручного обновления cookie без пересоздания аккаунта.
+function Set-GiryaAccountCookie {
+    param(
+        [Parameter(Mandatory)][string] $Name,
+        [Parameter(Mandatory)][string] $Cookie
+    )
+    $cfg = Get-GiryaConfig
+    $accounts = @($cfg.accounts)
+    $acc = $accounts | Where-Object { $_.name -eq $Name }
+    if (-not $acc) { throw "Аккаунт '$Name' не найден." }
+    $acc.cookie = Protect-GiryaSecret $Cookie.Trim()
+    $cfg.accounts = $accounts
+    Save-GiryaConfig $cfg
+}
+
 # Удалить аккаунт по имени.
 function Remove-GiryaAccount {
     param([Parameter(Mandatory)][string] $Name)

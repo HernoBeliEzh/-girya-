@@ -9,9 +9,9 @@
         "apiKey": "sk-girya-ВСТАВЬТЕ_КЛЮЧ_ИЗ_girya_key"
       },
       "models": {
-        "openai gpt-5.5": { "name": "openai gpt-5.5" },
-        "anthropic claude-sonnet-4.6": { "name": "anthropic claude-sonnet-4.6" },
-        "google gemini-3.1-pro-preview": { "name": "google gemini-3.1-pro-preview" }
+        "openai gpt-5.5": { "name": "openai gpt-5.5", "tool_call": true },
+        "anthropic claude-sonnet-4.6": { "name": "anthropic claude-sonnet-4.6", "tool_call": true },
+        "google gemini-3.1-pro-preview": { "name": "google gemini-3.1-pro-preview", "tool_call": true }
       }
     }
   }

@@ -23,6 +23,8 @@ function New-GiryaDefaultConfig {
     [pscustomobject]@{
         # Единый OpenAI-совместимый ключ, который выдаётся клиентам (OpenCode и др.)
         apiKey   = ''
+        # Отладочный лог последнего запроса/ответа в %APPDATA%\Girya\debug.log
+        debug    = $false
         # Настройки локального сервера
         server   = [pscustomobject]@{
             host = '127.0.0.1'
@@ -43,6 +45,8 @@ function New-GiryaDefaultConfig {
             # Бэкенд чата (Cloudflare Worker).
             backendBase     = 'https://backend.whizibackend.workers.dev'
             chatPath        = '/api/add-message?stream=true'
+            # Эндпоинт создания чата (нужен chat_id перед отправкой сообщения).
+            createChatPath  = '/api/create-chat'
             # Имя модели по умолчанию (формат whizi: "<провайдер> <модель>").
             defaultModel    = 'openai gpt-5.5'
             # Список моделей для /v1/models (имена в формате whizi). Дополняйте по вкусу.
@@ -77,6 +81,20 @@ function Get-GiryaConfig {
     # Гарантируем, что массив аккаунтов — всегда массив (ConvertFrom-Json даёт $null для пустых).
     if ($null -eq $cfg.accounts) {
         $cfg | Add-Member -NotePropertyName accounts -NotePropertyValue @() -Force
+    }
+    # Авто-миграция: дополнить старый конфиг новыми полями из умолчаний.
+    $def = New-GiryaDefaultConfig
+    foreach ($top in $def.PSObject.Properties.Name) {
+        if ($cfg.PSObject.Properties.Name -notcontains $top) {
+            $cfg | Add-Member -NotePropertyName $top -NotePropertyValue $def.$top -Force
+        }
+    }
+    if ($null -ne $cfg.whizi) {
+        foreach ($p in $def.whizi.PSObject.Properties.Name) {
+            if ($cfg.whizi.PSObject.Properties.Name -notcontains $p) {
+                $cfg.whizi | Add-Member -NotePropertyName $p -NotePropertyValue $def.whizi.$p -Force
+            }
+        }
     }
     return $cfg
 }

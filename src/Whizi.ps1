@@ -84,6 +84,52 @@ function Get-WhiziSessionId {
 
 # --- Получение короткоживущего JWT через Clerk -----------------------------
 
+# Разобрать строку cookie в упорядоченный словарь.
+function ConvertFrom-GiryaCookie {
+    param([string] $Cookie)
+    $dict = [ordered]@{}
+    if ([string]::IsNullOrWhiteSpace($Cookie)) { return $dict }
+    foreach ($pair in $Cookie.Split(';')) {
+        $p = $pair.Trim()
+        if ($p -eq '') { continue }
+        $idx = $p.IndexOf('=')
+        if ($idx -lt 1) { continue }
+        $k = $p.Substring(0, $idx).Trim()
+        $v = $p.Substring($idx + 1).Trim()
+        $dict[$k] = $v
+    }
+    return $dict
+}
+
+function ConvertTo-GiryaCookie {
+    param($Dict)
+    return (($Dict.Keys | ForEach-Object { "$_=$($Dict[$_])" }) -join '; ')
+}
+
+# Применить Set-Cookie из ответа Clerk к текущему cookie (ротация __client, __cf_bm и т.п.).
+# Возвращает новую строку cookie или $null, если изменений нет.
+function Merge-GiryaSetCookies {
+    param([string] $Cookie, [string[]] $SetCookies)
+    if (-not $SetCookies -or $SetCookies.Count -eq 0) { return $null }
+    $dict = ConvertFrom-GiryaCookie $Cookie
+    $changed = $false
+    foreach ($sc in $SetCookies) {
+        $first = $sc.Split(';')[0].Trim()
+        $idx = $first.IndexOf('=')
+        if ($idx -lt 1) { continue }
+        $k = $first.Substring(0, $idx).Trim()
+        $v = $first.Substring($idx + 1).Trim()
+        # Игнорируем удаляющие cookie.
+        if ($v -eq '' -and $sc -match 'Max-Age=0') { continue }
+        if (-not $dict.Contains($k) -or $dict[$k] -ne $v) {
+            $dict[$k] = $v
+            $changed = $true
+        }
+    }
+    if (-not $changed) { return $null }
+    return (ConvertTo-GiryaCookie $dict)
+}
+
 function Get-WhiziToken {
     param([Parameter(Mandatory)] $Account, [Parameter(Mandatory)] $Config)
 
@@ -104,32 +150,53 @@ function Get-WhiziToken {
     if ($w.clerkTemplate) { $path += "/$($w.clerkTemplate)" }
     $uri = "$($w.clerkBase)$path`?__clerk_api_version=$($w.clerkApiVersion)&_clerk_js_version=$($w.clerkJsVersion)"
 
-    $headers = @{
-        'Cookie'       = $cookie
-        'Accept'       = 'application/json'
-        'Content-Type' = 'application/x-www-form-urlencoded'
-        'Origin'       = $w.origin
-        'Referer'      = $w.origin + '/'
-        'User-Agent'   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
-    }
+    Add-Type -AssemblyName System.Net.Http
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $handler.UseCookies = $false   # cookie ставим вручную, Set-Cookie читаем сами
+    $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+    $client = [System.Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds(30)
 
     try {
-        $resp = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body '' -ErrorAction Stop
+        $req = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, $uri)
+        [void]$req.Headers.TryAddWithoutValidation('Cookie', $cookie)
+        [void]$req.Headers.TryAddWithoutValidation('Accept', 'application/json')
+        [void]$req.Headers.TryAddWithoutValidation('Origin', $w.origin)
+        [void]$req.Headers.TryAddWithoutValidation('Referer', $w.origin + '/')
+        [void]$req.Headers.TryAddWithoutValidation('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36')
+        $req.Content = [System.Net.Http.StringContent]::new('', [System.Text.Encoding]::UTF8, 'application/x-www-form-urlencoded')
+
+        $resp = $client.SendAsync($req).GetAwaiter().GetResult()
+        $bodyText = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+
+        if (-not $resp.IsSuccessStatusCode) {
+            $code = [int]$resp.StatusCode
+            if ($code -eq 401 -or $code -eq 403) {
+                throw "Clerk отклонил запрос токена (HTTP $code). Cookie аккаунта '$name' устарел или __client прокручен браузером — обновите cookie (girya cookie) и не используйте whizi в браузере параллельно."
+            }
+            throw "Clerk вернул HTTP $code для '$name': $bodyText"
+        }
+
+        # Сохранить ротацию cookie (новый __client и пр.) из Set-Cookie.
+        $setCookies = $null
+        if ($resp.Headers.TryGetValues('Set-Cookie', [ref]$setCookies)) {
+            $merged = Merge-GiryaSetCookies -Cookie $cookie -SetCookies @($setCookies)
+            if ($merged) {
+                Set-GiryaAccountCookie -Name $name -Cookie $merged | Out-Null
+            }
+        }
     }
-    catch {
-        $status = $null
-        if ($_.Exception.PSObject.Properties.Name -contains 'Response' -and $_.Exception.Response) {
-            try { $status = [int]$_.Exception.Response.StatusCode } catch {}
-        }
-        if ($status -eq 401 -or $status -eq 403) {
-            throw "Clerk отклонил запрос токена (HTTP $status). Cookie аккаунта '$name' устарел — обновите его."
-        }
-        throw "Ошибка получения токена Clerk для '$name': $($_.Exception.Message)"
+    finally {
+        $client.Dispose()
     }
 
+    $respObj = $null
+    try { $respObj = $bodyText | ConvertFrom-Json } catch {}
     $jwt = $null
-    if ($resp.PSObject.Properties.Name -contains 'jwt') { $jwt = [string]$resp.jwt }
-    elseif ($resp.PSObject.Properties.Name -contains 'token') { $jwt = [string]$resp.token }
+    if ($respObj) {
+        if ($respObj.PSObject.Properties.Name -contains 'jwt') { $jwt = [string]$respObj.jwt }
+        elseif ($respObj.PSObject.Properties.Name -contains 'token') { $jwt = [string]$respObj.token }
+    }
     if ([string]::IsNullOrWhiteSpace($jwt)) {
         throw "Clerk вернул ответ без поля jwt для '$name'."
     }
@@ -142,6 +209,14 @@ function Get-WhiziToken {
     }
     $script:GiryaTokenCache[$name] = @{ jwt = $jwt; exp = $exp }
     return $jwt
+}
+
+# Обрезать текст до N символов с пометкой (whizi режет длинный content по началу).
+function Get-GiryaTrimmed {
+    param([string] $Text, [int] $Max)
+    if ($null -eq $Text) { return '' }
+    if ($Max -le 0 -or $Text.Length -le $Max) { return $Text }
+    return $Text.Substring(0, $Max) + "`n...[обрезано $($Text.Length - $Max) симв.]"
 }
 
 # Привести content (строка или массив частей OpenAI) к строке.
@@ -159,28 +234,157 @@ function Get-GiryaMessageText {
     return [string]$Content
 }
 
-# Свернуть историю диалога (OpenAI messages) в одно текстовое поле content.
-# whizi хранит историю на своей стороне по chat_id, но мы создаём новый чат на
-# каждый запрос, поэтому передаём весь контекст одним сообщением.
+# Свернуть историю диалога (OpenAI messages) в один текст, включая вызовы
+# инструментов (tool_calls у assistant) и их результаты (role=tool).
 function Convert-GiryaMessagesToContent {
-    param([Parameter(Mandatory)][array] $Messages)
+    param([Parameter(Mandatory)][array] $Messages, [bool] $HasTools = $false, [int] $MaxPerMessage = 0)
     $arr = @($Messages)
-    if ($arr.Count -eq 1) {
-        return (Get-GiryaMessageText $arr[0].content)
+    if ($arr.Count -eq 1 -and -not $HasTools) {
+        $only = $arr[0]
+        $hasTC = ($only.PSObject.Properties.Name -contains 'tool_calls') -and $only.tool_calls
+        if (-not $hasTC -and [string]$only.role -ne 'tool') {
+            return (Get-GiryaMessageText $only.content)
+        }
     }
     $sb = [System.Text.StringBuilder]::new()
     foreach ($m in $arr) {
-        $role = switch ([string]$m.role) {
+        $roleRaw = [string]$m.role
+        $hasTC = ($m.PSObject.Properties.Name -contains 'tool_calls') -and $m.tool_calls
+        if ($roleRaw -eq 'tool') {
+            $tid = ''
+            if ($m.PSObject.Properties.Name -contains 'tool_call_id') { $tid = [string]$m.tool_call_id }
+            [void]$sb.AppendLine("РЕЗУЛЬТАТ ИНСТРУМЕНТА (tool_call_id=$tid):")
+            [void]$sb.AppendLine((Get-GiryaTrimmed (Get-GiryaMessageText $m.content) $MaxPerMessage))
+            [void]$sb.AppendLine()
+            continue
+        }
+        $role = switch ($roleRaw) {
             'system'    { 'System' }
             'assistant' { 'Assistant' }
             'user'      { 'User' }
-            'tool'      { 'Tool' }
-            default     { [string]$m.role }
+            default     { $roleRaw }
         }
-        [void]$sb.AppendLine("${role}: $(Get-GiryaMessageText $m.content)")
+        $txt = Get-GiryaTrimmed (Get-GiryaMessageText $m.content) $MaxPerMessage
+        if ($hasTC) {
+            $calls = foreach ($tc in @($m.tool_calls)) {
+                $fn = $tc.function
+                $a = if ($fn.PSObject.Properties.Name -contains 'arguments') { [string]$fn.arguments } else { '{}' }
+                "<tool_call>{""name"":""$($fn.name)"",""arguments"":$a}</tool_call>"
+            }
+            [void]$sb.AppendLine("${role}:")
+            if ($txt) { [void]$sb.AppendLine($txt) }
+            [void]$sb.AppendLine(($calls -join "`n"))
+        } else {
+            [void]$sb.AppendLine("${role}: $txt")
+        }
         [void]$sb.AppendLine()
     }
     return $sb.ToString().TrimEnd()
+}
+
+# Сформировать инструкцию для модели по работе с инструментами (эмуляция tool-calling).
+function Build-GiryaToolsPrompt {
+    param([Parameter(Mandatory)][array] $Tools)
+    $sb = [System.Text.StringBuilder]::new()
+    [void]$sb.AppendLine('# Режим агента OpenCode — вызов инструментов')
+    [void]$sb.AppendLine('Ты решаешь задачу, вызывая инструменты. Чтобы вызвать инструмент, выведи СТРОГО один или несколько блоков:')
+    [void]$sb.AppendLine('<tool_call>{"name":"ИМЯ_ИНСТРУМЕНТА","arguments":{...}}</tool_call>')
+    [void]$sb.AppendLine('Правила:')
+    [void]$sb.AppendLine('- Внутри блока — только валидный JSON. "arguments" — объект строго по схеме инструмента.')
+    [void]$sb.AppendLine('- ИСПОЛЬЗУЙ ТОЧНЫЕ имена параметров из схемы (если в схеме "command" — пиши "command", а не "cmd"). Не добавляй параметры, которых нет в схеме.')
+    [void]$sb.AppendLine('- "name" должен ТОЧНО совпадать с именем инструмента из списка ниже.')
+    [void]$sb.AppendLine('- Если вызываешь инструменты — НЕ пиши никакого другого текста, только блоки <tool_call>.')
+    [void]$sb.AppendLine('- Можно вызвать несколько инструментов сразу (несколько блоков подряд).')
+    [void]$sb.AppendLine('- НЕ придумывай результаты — дождись ответа инструмента (он придёт как "РЕЗУЛЬТАТ ИНСТРУМЕНТА").')
+    [void]$sb.AppendLine('- Когда инструменты больше не нужны и можно ответить пользователю — пиши обычный текст БЕЗ блоков.')
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('Доступные инструменты:')
+    foreach ($t in $Tools) {
+        $fn = $t.function
+        if (-not $fn) { continue }
+        [void]$sb.AppendLine("## $($fn.name)")
+        if ($fn.PSObject.Properties.Name -contains 'description' -and $fn.description) {
+            # Описание режем (whizi ограничивает длину content).
+            [void]$sb.AppendLine((Get-GiryaTrimmed ([string]$fn.description) 220))
+        }
+        if ($fn.PSObject.Properties.Name -contains 'parameters' -and $fn.parameters) {
+            $schema = $fn.parameters | ConvertTo-Json -Depth 20 -Compress
+            [void]$sb.AppendLine("Параметры (JSON Schema): $schema")
+        }
+        [void]$sb.AppendLine('')
+    }
+    return $sb.ToString().TrimEnd()
+}
+
+# Разобрать ответ модели на вызовы инструментов. Возвращает массив
+# @{ id; name; arguments(строка JSON) } либо пустой массив, если вызовов нет.
+function Get-GiryaToolCalls {
+    param([Parameter(Mandatory)][string] $Text)
+    $calls = @()
+    $rx = [regex]'(?s)<tool_call>\s*(\{.*?\})\s*</tool_call>'
+    $matches = $rx.Matches($Text)
+    $i = 0
+    foreach ($mm in $matches) {
+        $json = $mm.Groups[1].Value
+        $obj = $null
+        try { $obj = $json | ConvertFrom-Json } catch { continue }
+        if (-not ($obj.PSObject.Properties.Name -contains 'name')) { continue }
+        $argStr = '{}'
+        if ($obj.PSObject.Properties.Name -contains 'arguments' -and $null -ne $obj.arguments) {
+            if ($obj.arguments -is [string]) { $argStr = $obj.arguments }
+            else { $argStr = $obj.arguments | ConvertTo-Json -Depth 20 -Compress }
+        }
+        $calls += @{
+            id        = "call_$([guid]::NewGuid().ToString('N').Substring(0,24))"
+            name      = [string]$obj.name
+            arguments = $argStr
+        }
+        $i++
+    }
+    return $calls
+}
+
+# Создать новый чат в whizi и вернуть его chat_id.
+# whizi не принимает произвольный chat_id — его нужно сначала создать здесь.
+function New-WhiziChat {
+    param(
+        [Parameter(Mandatory)][string] $Jwt,
+        [Parameter(Mandatory)][string] $Model,
+        [Parameter(Mandatory)][string] $UserId,
+        [Parameter(Mandatory)] $Config
+    )
+    $w = $Config.whizi
+    $uri = $w.backendBase.TrimEnd('/') + $w.createChatPath
+    $body = @{ user_id = $UserId; model = $Model; title = 'Girya' } | ConvertTo-Json -Depth 6
+
+    Add-Type -AssemblyName System.Net.Http
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+    $client = [System.Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds(30)
+    try {
+        $req = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, $uri)
+        [void]$req.Headers.TryAddWithoutValidation('Authorization', "Bearer $Jwt")
+        [void]$req.Headers.TryAddWithoutValidation('Origin', $w.origin)
+        [void]$req.Headers.TryAddWithoutValidation('Referer', $w.origin + '/')
+        [void]$req.Headers.TryAddWithoutValidation('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36')
+        $req.Content = [System.Net.Http.StringContent]::new($body, [System.Text.Encoding]::UTF8, 'application/json')
+        $resp = $client.SendAsync($req).GetAwaiter().GetResult()
+        $txt = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        if (-not $resp.IsSuccessStatusCode) {
+            throw "Не удалось создать чат whizi (HTTP $([int]$resp.StatusCode)): $txt"
+        }
+        $obj = $txt | ConvertFrom-Json
+        $id = $null
+        foreach ($p in 'chat_id','id','chatId') {
+            if ($obj.PSObject.Properties.Name -contains $p -and $obj.$p) { $id = [string]$obj.$p; break }
+        }
+        if ([string]::IsNullOrWhiteSpace($id)) { throw "Создание чата: в ответе нет chat_id: $txt" }
+        return $id
+    }
+    finally {
+        $client.Dispose()
+    }
 }
 
 # --- Построение тела запроса к бэкенду чата (схема whizi /api/add-message) --
@@ -189,17 +393,51 @@ function Build-WhiziRequestBody {
         [Parameter(Mandatory)][array] $Messages,
         [Parameter(Mandatory)][string] $Model,
         [Parameter(Mandatory)][string] $UserId,
-        [Parameter(Mandatory)] $Config
+        [Parameter(Mandatory)][string] $ChatId,
+        [Parameter(Mandatory)] $Config,
+        [array] $Tools
     )
+    $hasTools = ($Tools -and @($Tools).Count -gt 0)
+    $webSearch = [bool]$Config.whizi.webSearch
+    $arr = @($Messages)
+
+    # whizi обрезает длинный content, СОХРАНЯЯ НАЧАЛО. Поэтому важное (инструкции +
+    # текущая задача/диалог) ставим в начало, а громоздкий системный промпт OpenCode —
+    # обрезанным в конец как фоновый контекст.
+    $sysMsgs   = @($arr | Where-Object { [string]$_.role -eq 'system' })
+    $convoMsgs = @($arr | Where-Object { [string]$_.role -ne 'system' })
+
+    if ($hasTools) {
+        $webSearch = $false   # в режиме агента веб-поиск мешает формату вызовов
+        $convo = Convert-GiryaMessagesToContent -Messages $convoMsgs -HasTools $true -MaxPerMessage 3000
+        $parts = @()
+        $parts += (Build-GiryaToolsPrompt -Tools $Tools)
+        $parts += "===== ДИАЛОГ (выполни последний запрос пользователя, вызывая инструменты) =====`n$convo"
+        $sysText = ($sysMsgs | ForEach-Object { Get-GiryaMessageText $_.content }) -join "`n"
+        if ($sysText) { $parts += "===== ФОНОВЫЙ КОНТЕКСТ OpenCode (справочно) =====`n$(Get-GiryaTrimmed $sysText 1500)" }
+        $content = $parts -join "`n`n"
+    }
+    elseif ($arr.Count -eq 1) {
+        $content = Get-GiryaMessageText $arr[0].content
+    }
+    else {
+        $convo = Convert-GiryaMessagesToContent -Messages $convoMsgs -MaxPerMessage 6000
+        $sysText = ($sysMsgs | ForEach-Object { Get-GiryaMessageText $_.content }) -join "`n"
+        if ($sysText) {
+            $content = "===== ДИАЛОГ =====`n$convo`n`n===== ФОНОВЫЙ КОНТЕКСТ (справочно) =====`n$(Get-GiryaTrimmed $sysText 2000)"
+        } else {
+            $content = $convo
+        }
+    }
     return @{
-        chat_id            = [guid]::NewGuid().ToString()
+        chat_id            = $ChatId
         user_id            = $UserId
-        content            = (Convert-GiryaMessagesToContent -Messages $Messages)
+        content            = $content
         files              = @()
         image_url          = $null
         model              = $Model
         user_type          = $Config.whizi.userType
-        web_search_enabled = [bool]$Config.whizi.webSearch
+        web_search_enabled = $webSearch
     }
 }
 
@@ -260,11 +498,13 @@ function Get-WhiziEvent {
     return $null
 }
 
-# --- Основной вызов чата: возвращает полный текст ответа ассистента ---------
+# --- Основной вызов чата ----------------------------------------------------
+# Возвращает хэш: @{ content = <строка|null>; toolCalls = @(...) }.
 function Invoke-WhiziChat {
     param(
         [Parameter(Mandatory)][array] $Messages,
-        [string] $Model
+        [string] $Model,
+        [array] $Tools
     )
     $cfg = Get-GiryaConfig
     $account = Get-GiryaActiveAccount
@@ -283,7 +523,10 @@ function Invoke-WhiziChat {
     $w = $cfg.whizi
     $uri = ($w.backendBase.TrimEnd('/')) + $w.chatPath
 
-    $bodyObj  = Build-WhiziRequestBody -Messages $Messages -Model $Model -UserId $userId -Config $cfg
+    # whizi требует существующий chat_id — создаём новый чат на каждый запрос.
+    $chatId = New-WhiziChat -Jwt $jwt -Model $Model -UserId $userId -Config $cfg
+
+    $bodyObj  = Build-WhiziRequestBody -Messages $Messages -Model $Model -UserId $userId -ChatId $chatId -Config $cfg -Tools $Tools
     $bodyJson = $bodyObj | ConvertTo-Json -Depth 12
 
     Add-Type -AssemblyName System.Net.Http
@@ -345,7 +588,15 @@ function Invoke-WhiziChat {
         if ([string]::IsNullOrEmpty($result)) {
             throw 'Бэкенд whizi вернул пустой ответ (формат SSE мог измениться — проверьте Get-WhiziEvent в Whizi.ps1).'
         }
-        return $result
+
+        # Если были инструменты — пытаемся распознать вызовы в ответе модели.
+        if ($Tools -and @($Tools).Count -gt 0) {
+            $toolCalls = @(Get-GiryaToolCalls -Text $result)
+            if ($toolCalls.Count -gt 0) {
+                return @{ content = $null; toolCalls = $toolCalls }
+            }
+        }
+        return @{ content = $result; toolCalls = @() }
     }
     finally {
         $client.Dispose()
